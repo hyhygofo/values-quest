@@ -4,6 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GOFO Values Quest · 价值观大冒险</title>
+<!-- 飞书登录回调中继：检测到授权码时自动转发到本地测试服务器 -->
+<script>
+(function(){
+  var p = new URLSearchParams(location.search);
+  if (p.has('code') && p.has('state')) {
+    location.replace('http://localhost:3000/auth/feishu/callback?code=' + p.get('code') + '&state=' + p.get('state'));
+  }
+})();
+</script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0a0a2e;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;overflow:hidden}
