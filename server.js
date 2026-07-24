@@ -1,12 +1,13 @@
-// values-quest 本地登录服务（测试环境）
+// values-quest 登录服务（本地 / Vercel 通用）
 // 零依赖：仅用 Node 内置模块。托管 index.html + 飞书 OAuth 授权登录。
+// 状态层 serverless 友好：会话用签名 Cookie，state 用签名短时令牌，禁用列表走环境变量。
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// ---- 读取 .env ----
+// ---- 读取 .env（本地开发用；Vercel 上由平台环境变量提供，文件不存在则忽略）----
 const ENV = {};
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -15,36 +16,39 @@ if (fs.existsSync(envPath)) {
     if (m) ENV[m[1]] = m[2];
   }
 }
-const APP_ID = ENV.FEISHU_APP_ID;
-const APP_SECRET = ENV.FEISHU_APP_SECRET;
-const PORT = Number(ENV.PORT || 3000);
-const BASE_URL = ENV.BASE_URL || `http://localhost:${PORT}`;
+const APP_ID = ENV.FEISHU_APP_ID || process.env.FEISHU_APP_ID;
+const APP_SECRET = ENV.FEISHU_APP_SECRET || process.env.FEISHU_APP_SECRET;
+const PORT = Number(ENV.PORT || process.env.PORT || 3000);
+// BASE_URL：优先 env 覆盖；否则 Vercel 用 VERCEL_URL；否则回退 localhost
+const BASE_URL = ENV.BASE_URL || process.env.BASE_URL
+  || ('https://' + (process.env.VERCEL_URL || `localhost:${PORT}`));
 // 飞书重定向 URI 必须精确匹配开放平台白名单。
 const REDIRECT_URI = BASE_URL.replace(/\/$/, '') + '/auth/feishu/callback';
 if (!APP_ID || !APP_SECRET) { console.error('缺少 FEISHU_APP_ID / FEISHU_APP_SECRET'); process.exit(1); }
 
-// ---- 状态与会话（落盘持久化，一次性 state，可跨进程重启存活）----
-const DATA_DIR = path.join(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const STATES_FILE = path.join(DATA_DIR, 'states.json');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-function loadMap(file) {
-  try { return new Map(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')))); }
-  catch { return new Map(); }
+// ---- 无状态签名工具：用 APP_SECRET 作为 HMAC key（同源 secret，无需额外环境变量）----
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
-function saveMap(file, map) {
-  fs.writeFileSync(file, JSON.stringify(Object.fromEntries(map)));
+function sign(obj) {
+  const payload = b64url(JSON.stringify(obj));
+  const sig = crypto.createHmac('sha256', APP_SECRET).update(payload).digest('hex');
+  return payload + '.' + sig;
 }
-const states = loadMap(STATES_FILE);     // state -> expireAt
-const sessions = loadMap(SESSIONS_FILE); // sid -> { user, createdAt }
-// 启动时清理已过期 state
-for (const [s, exp] of states) if (Date.now() > exp) states.delete(s);
-saveMap(STATES_FILE, states);
-
-function loadUsers() { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return {}; } }
-function saveUsers(u) { fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2)); }
+function unsign(token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+  const [payload, sig] = token.split('.');
+  const expected = crypto.createHmac('sha256', APP_SECRET).update(payload).digest('hex');
+  const a = Buffer.from(sig); const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try { return JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); }
+  catch { return null; }
+}
+// 禁用用户列表（飞书 open_id），逗号分隔，走环境变量，零外部存储
+function disabledList() {
+  return (process.env.DISABLED_OPEN_IDS || ENV.DISABLED_OPEN_IDS || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+}
 
 function httpsJson(method, url, headers, body) {
   return new Promise((resolve, reject) => {
@@ -72,9 +76,10 @@ function send(res, code, body, headers) {
   res.writeHead(code, Object.assign({ 'Content-Type': 'text/html; charset=utf-8' }, headers));
   res.end(body);
 }
+// 当前登录用户：从签名 Cookie 中恢复（验签失败返回 null）
 function currentUser(req) {
-  const sid = getCookie(req, 'vq_sid');
-  return sid && sessions.get(sid) ? sessions.get(sid).user : null;
+  const c = getCookie(req, 'vq_user');
+  return c ? unsign(c) : null;
 }
 
 const LOGIN_PAGE = (msg) => `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
@@ -87,28 +92,25 @@ a.btn{display:inline-block;padding:14px 40px;border-radius:10px;background:#3370
 <div class="card"><h1>价值观大冒险</h1><p>GOFO Values Quest · 请使用飞书账号登录</p>
 <a class="btn" href="/auth/feishu/login">🚀 飞书登录</a><div class="err">${msg || ''}</div></div></body></html>`;
 
-const server = http.createServer(async (req, res) => {
+const handler = async (req, res) => {
   const u = new URL(req.url, BASE_URL);
 
-  // 发起授权：生成一次性 state
+  // 发起授权：生成签名短时 state（含 10 分钟过期，无需服务端存储）
   if (u.pathname === '/auth/feishu/login') {
-    const state = crypto.randomBytes(24).toString('hex');
-    states.set(state, Date.now() + 10 * 60 * 1000);
-    saveMap(STATES_FILE, states);
+    const state = sign({ n: crypto.randomBytes(8).toString('hex'), exp: Date.now() + 10 * 60 * 1000 });
     const authUrl = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize'
       + `?client_id=${APP_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&state=${state}`;
     res.writeHead(302, { Location: authUrl });
     return res.end();
   }
 
-  // 回调：先校验 state，再换取用户身份
+  // 回调：先校验 state 签名与有效期，再换取用户身份
   if (u.pathname === '/auth/feishu/callback') {
     const state = u.searchParams.get('state');
     const code = u.searchParams.get('code');
-    const exp = states.get(state);
-    states.delete(state); saveMap(STATES_FILE, states); // 一次性，无论成败都作废
-    if (!state || !exp) return send(res, 403, LOGIN_PAGE('登录失败：state 无效或已使用，请重新登录'));
-    if (Date.now() > exp) return send(res, 403, LOGIN_PAGE('登录失败：state 已过期，请重新登录'));
+    const st = unsign(state);
+    if (!st) return send(res, 403, LOGIN_PAGE('登录失败：state 无效，请重新登录'));
+    if (Date.now() > st.exp) return send(res, 403, LOGIN_PAGE('登录失败：state 已过期，请重新登录'));
     if (!code) return send(res, 400, LOGIN_PAGE('登录失败：缺少授权码'));
     try {
       const tok = await httpsJson('POST', 'https://open.feishu.cn/open-apis/authen/v2/oauth/token', {}, {
@@ -120,23 +122,20 @@ const server = http.createServer(async (req, res) => {
         { Authorization: 'Bearer ' + tok.access_token });
       if (info.code !== 0) return send(res, 401, LOGIN_PAGE('获取用户信息失败：' + info.msg));
       const d = info.data;
-      const users = loadUsers();
-      const existing = users[d.open_id];
-      if (existing && existing.status === 'disabled') {
+      // 禁用用户拦截（走环境变量 DISABLED_OPEN_IDS，零外部存储）
+      if (disabledList().includes(d.open_id)) {
         return send(res, 403, LOGIN_PAGE(`账号 ${d.name} 已被停用，禁止登录`));
       }
-      users[d.open_id] = {
+      // 登录身份写入签名 Cookie（HttpOnly，30 天），无需服务端会话存储
+      const user = {
         open_id: d.open_id, union_id: d.union_id, name: d.name,
         tenant_key: d.tenant_key || '', // 真实 tenant_key 来自首次登录返回，不编造
-        status: existing ? existing.status : 'active',
-        first_login: existing ? existing.first_login : new Date().toISOString(),
-        last_login: new Date().toISOString(),
+        login_at: new Date().toISOString(),
       };
-      saveUsers(users);
-      const sid = crypto.randomBytes(24).toString('hex');
-      sessions.set(sid, { user: users[d.open_id], createdAt: Date.now() });
-      saveMap(SESSIONS_FILE, sessions);
-      res.writeHead(302, { Location: '/', 'Set-Cookie': `vq_sid=${sid}; HttpOnly; Path=/; SameSite=Lax` });
+      res.writeHead(302, {
+        Location: '/',
+        'Set-Cookie': `vq_user=${sign(user)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${30 * 24 * 3600}`,
+      });
       return res.end();
     } catch (e) {
       return send(res, 500, LOGIN_PAGE('登录异常：' + e.message));
@@ -144,9 +143,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === '/logout') {
-    const sid = getCookie(req, 'vq_sid');
-    if (sid) { sessions.delete(sid); saveMap(SESSIONS_FILE, sessions); }
-    res.writeHead(302, { Location: '/', 'Set-Cookie': 'vq_sid=; Max-Age=0; Path=/' });
+    res.writeHead(302, { Location: '/', 'Set-Cookie': 'vq_user=; Max-Age=0; Path=/' });
     return res.end();
   }
 
@@ -157,7 +154,20 @@ const server = http.createServer(async (req, res) => {
       { 'Content-Type': 'application/json; charset=utf-8' });
   }
 
-  // 游戏首页：未登录先看登录页
+  // 静态资源（assets）直接读取返回，提升 Vercel 兼容性
+  if (u.pathname.startsWith('/assets/')) {
+    const fp = path.join(__dirname, u.pathname);
+    const assetsRoot = path.join(__dirname, 'assets');
+    if (fp.startsWith(assetsRoot) && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+      const ext = path.extname(fp);
+      const ct = { '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png',
+        '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.json': 'application/json' }[ext] || 'application/octet-stream';
+      return send(res, 200, fs.readFileSync(fp), { 'Content-Type': ct });
+    }
+    return send(res, 404, 'Not Found');
+  }
+
+  // 游戏首页：未登录先看登录页，已登录返回游戏页
   if (u.pathname === '/' || u.pathname === '/index.html') {
     const user = currentUser(req);
     if (!user) return send(res, 200, LOGIN_PAGE());
@@ -165,9 +175,15 @@ const server = http.createServer(async (req, res) => {
   }
 
   send(res, 404, 'Not Found');
-});
+};
 
-server.listen(PORT, () => {
-  console.log(`values-quest 测试服务已启动: ${BASE_URL}`);
-  console.log(`飞书回调地址: ${REDIRECT_URI}`);
-});
+// 供 Vercel（api/index.js require 本文件）使用
+module.exports = handler;
+
+// 本地运行：VERCEL 未设置时才 listen；Vercel 上由平台托管，不自行监听端口
+if (!process.env.VERCEL) {
+  http.createServer(handler).listen(PORT, () => {
+    console.log(`values-quest 服务已启动: ${BASE_URL}`);
+    console.log(`飞书回调地址: ${REDIRECT_URI}`);
+  });
+}
